@@ -104,9 +104,14 @@ export default function Index() {
           </View>
 
           <View style={styles.bottomInfo}>
-            <Text style={styles.infoText}>
-              By continuing, you agree to our Terms of Service and Privacy Policy.
-            </Text>
+           <Text style={styles.infoText}>
+  By continuing, you agree to our Terms of Service and Privacy Policy.
+</Text>
+<Text style={styles.poweredText}>
+  Powered by PEH Network Hub™
+</Text>
+
+
           </View>
         </ScrollView>
       </KeyboardAvoidingView>
@@ -120,6 +125,12 @@ const INPUT_BG = "#FFFFFF";
 const TEXT_COLOR = "#333333";
 
 const styles = StyleSheet.create({
+  poweredText: {
+    fontSize: 10,
+    color: '#888',
+    textAlign: 'center',
+    marginTop: 2,
+  },
   container: {
     flex: 1,
     backgroundColor: BACKGROUND,
@@ -178,7 +189,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   infoText: {
-    bottom: 50,
+    bottom: -1,
     color: "#888888",
     fontSize: 12,
     textAlign: "center",
