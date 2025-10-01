@@ -66,7 +66,6 @@ export default function RootLayout() {
     <Stack
       screenOptions={{
         headerShown: true,
-        // Global custom header for all screens
         header: ({ route, options }) => (
           <CustomHeader
             title={(options.title as string) || route.name || ""}
@@ -79,10 +78,21 @@ export default function RootLayout() {
         name="index"
         options={{
           title: "Cravory",
-          // You can also set a default per-screen progress here if needed:
           // headerProgress: 25,
-          // width: '30%',
-          // top: 25, 
+        }}
+      />
+      <Stack.Screen
+        name="otp"
+        options={{
+          title: "OTP Verification",
+          headerProgress: 50,
+        }}
+      />
+      <Stack.Screen
+        name="mainpage"
+        options={{
+          title: "Cravory",
+          headerProgress: 100,
         }}
       />
       <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
