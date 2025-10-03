@@ -1,4 +1,5 @@
 import { AntDesign, MaterialCommunityIcons } from "@expo/vector-icons";
+import * as Location from "expo-location";
 import { useNavigation, useRouter } from "expo-router";
 import React, { useEffect, useState } from "react";
 import {
@@ -34,6 +35,22 @@ export default function Index() {
   useEffect(() => {
     navigation.setParams({ progress: 25 } as any);
   }, [navigation]);
+
+  // NEW: ask for location permission and log coordinates
+  useEffect(() => {
+    (async () => {
+      try {
+        const { status } = await Location.requestForegroundPermissionsAsync();
+        console.log("[Location] permission:", status);
+        if (status === "granted") {
+          const pos = await Location.getCurrentPositionAsync({});
+          console.log("[Location] coords:", pos.coords);
+        }
+      } catch (e: any) {
+        console.error("[Location] error:", e?.message || e);
+      }
+    })();
+  }, []);
 
   // NEW: valid when exactly 10 digits
   const isValidPhone = phone.length === 10;
