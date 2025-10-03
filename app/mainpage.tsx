@@ -1,8 +1,12 @@
+import { Ionicons } from "@expo/vector-icons";
 import { useFocusEffect } from "@react-navigation/native";
 import Constants from "expo-constants";
 import * as ImagePicker from "expo-image-picker";
-import React, { useCallback, useState } from "react";
-import { ActivityIndicator, Image, Modal, Platform, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from "react-native";
+import * as Location from "expo-location";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
+import { ActivityIndicator, Image, Modal, Platform, ScrollView, StyleSheet, Switch, Text, TextInput, TouchableOpacity, View } from "react-native";
+
+const THEME = "#FC8019";
 
 // Backend API URL (auto-resolve for device/emulator)
 const resolveApiUrl = () => {
@@ -31,6 +35,17 @@ export default function MainPage() {
   const [err, setErr] = useState<string | null>(null);
   const [restaurants, setRestaurants] = useState<any[]>([]);
   const [expandedId, setExpandedId] = useState<string | null>(null);
+  // NEW: cache for resolved coords of short links
+  const [coordCache, setCoordCache] = useState<Record<string, { lat: number; lng: number }>>({});
+
+  // NEW: UI state for Zomato-like header
+  const [search, setSearch] = useState("");
+  const [vegOnly, setVegOnly] = useState(false);
+  const categories = ["All", "Biryani", "Fried Rice", "Bowl", "Pizza", "Snacks", "Curry"];
+  const [activeCategory, setActiveCategory] = useState("All");
+
+  // NEW: user coords for distance calc
+  const [coords, setCoords] = useState<{ latitude: number; longitude: number } | null>(null);
   const canSubmit = name.trim() && mapLink.trim() && dishes.trim() && restaurantImage && dishImage;
 
   const pickImage = async (which: "restaurant" | "dish") => {
@@ -66,6 +81,28 @@ export default function MainPage() {
     setErr(null);
   };
 
+  // NEW: get user location (try last known, then request)
+  useFocusEffect(
+    useCallback(() => {
+      (async () => {
+        try {
+          const last = await Location.getLastKnownPositionAsync();
+          if (last?.coords) {
+            setCoords({ latitude: last.coords.latitude, longitude: last.coords.longitude });
+          } else {
+            const { status } = await Location.requestForegroundPermissionsAsync();
+            if (status === "granted") {
+              const pos = await Location.getCurrentPositionAsync({});
+              setCoords({ latitude: pos.coords.latitude, longitude: pos.coords.longitude });
+            }
+          }
+        } catch (e: any) {
+          console.error("[Location] mainpage error:", e?.message || e);
+        }
+      })();
+    }, [])
+  );
+
   const fetchRestaurants = useCallback(async () => {
     try {
       const res = await fetch(`${API_URL}/api/restaurants`);
@@ -83,6 +120,151 @@ export default function MainPage() {
       fetchRestaurants();
     }, [fetchRestaurants])
   );
+
+  // Helper: parse lat/lng from any string (URL or HTML)
+  const parseLatLngFromString = (s?: string): { lat: number; lng: number } | null => {
+    if (!s) return null;
+    try {
+      // @lat,lng
+      let m = s.match(/@(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/);
+      if (m) return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+      // q=lat,lng or query=lat,lng
+      m = s.match(/[?&](?:q|query)=(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/);
+      if (m) return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+      // ll=lat,lng
+      m = s.match(/[?&]ll=(-?\d+(?:\.\d+)?),\s*(-?\d+(?:\.\d+)?)/);
+      if (m) return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+      // !3d<lat>!4d<lng>
+      m = s.match(/!3d(-?\d+(?:\.\d+)?)!4d(-?\d+(?:\.\d+)?)/);
+      if (m) return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+      // center=<lat>%2C<lng> (encoded comma)
+      m = s.match(/[?&]center=(-?\d+(?:\.\d+)?)%2C(-?\d+(?:\.\d+)?)/i);
+      if (m) return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+      // "center":{"lat":..,"lng":..} in HTML
+      m = s.match(/"center"\s*:\s*{\s*"lat"\s*:\s*(-?\d+(?:\.\d+)?),\s*"lng"\s*:\s*(-?\d+(?:\.\d+)?)\s*}/);
+      if (m) return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+      // generic fallback: two floats separated by comma/space
+      m = s.match(/(-?\d+(?:\.\d+)?)[,\s]+(-?\d+(?:\.\d+)?)/);
+      if (m) return { lat: parseFloat(m[1]), lng: parseFloat(m[2]) };
+    } catch {
+      // ignore
+    }
+    return null;
+  };
+
+  // Helper: parse from URL (calls string parser)
+  const parseLatLng = (link?: string) => parseLatLngFromString(link || "");
+
+  // NEW: resolve short links by following redirects and scanning final URL and HTML
+  const resolveLatLngFromLink = async (link: string): Promise<{ lat: number; lng: number } | null> => {
+    try {
+      const res = await fetch(link, { method: "GET" });
+      const finalUrl = res.url || link;
+      let coords = parseLatLngFromString(finalUrl);
+      if (coords) {
+        console.log("[ResolveLatLng] from final URL:", finalUrl, coords);
+        return coords;
+      }
+      const html = await res.text();
+      coords = parseLatLngFromString(html);
+      if (coords) {
+        console.log("[ResolveLatLng] from HTML body for:", finalUrl, coords);
+        return coords;
+      }
+      console.warn("[ResolveLatLng] could not extract coords:", link);
+      return null;
+    } catch (e: any) {
+      console.error("[ResolveLatLng] fetch error:", e?.message || e);
+      return null;
+    }
+  };
+
+  // NEW: for restaurants whose link didn't yield coords, try resolving and cache results
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const pending = restaurants
+        .filter((r) => r?.mapLink && !parseLatLng(r.mapLink) && !coordCache[r.mapLink])
+        .slice(0, 5); // limit concurrent a bit
+      for (const r of pending) {
+        const c = await resolveLatLngFromLink(r.mapLink);
+        if (c && !cancelled) {
+          setCoordCache((prev) => ({ ...prev, [r.mapLink]: c }));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [restaurants, coordCache]);
+
+  // Helper: haversine distance in km (stable atan2 variant)
+  const distanceKm = (a: { latitude: number; longitude: number }, b: { lat: number; lng: number }) => {
+    const toRad = (x: number) => (x * Math.PI) / 180;
+    const R = 6371; // km
+    const φ1 = toRad(a.latitude);
+    const φ2 = toRad(b.lat);
+    const Δφ = toRad(b.lat - a.latitude);
+    const Δλ = toRad(b.lng - a.longitude);
+    const sinΔφ = Math.sin(Δφ / 2);
+    const sinΔλ = Math.sin(Δλ / 2);
+    const h = sinΔφ * sinΔφ + Math.cos(φ1) * Math.cos(φ2) * sinΔλ * sinΔλ;
+    const c = 2 * Math.atan2(Math.sqrt(h), Math.sqrt(1 - h));
+    return R * c;
+  };
+
+  // Helper: format distance (e.g., "850 m" or "1.4 km")
+  const formatDistance = (km: number) => {
+    if (!isFinite(km)) return "";
+    if (km < 1) {
+      const m = Math.round(km * 1000);
+      return `${m} m`;
+    }
+    return `${km.toFixed(km < 10 ? 1 : 0)} km`;
+  };
+
+  // Helper: stable pseudo rating based on name (3.8 - 4.8)
+  const ratingFor = (name: string) => {
+    let h = 0;
+    for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
+    return Math.round((3.8 + (h % 1000) / 1000) * 10) / 10 > 4.8 ? 4.8 : Math.round((3.8 + (h % 1000) / 1000) * 10) / 10;
+  };
+
+  // NEW: derive list with distance/time + filters (use cache as fallback)
+  const shownRestaurants = useMemo(() => {
+    const list = restaurants.map((r) => {
+      const latlng = parseLatLng(r.mapLink) || coordCache[r.mapLink];
+      let dist: number | null = null;
+      if (coords && latlng) dist = distanceKm(coords, latlng);
+      const minutes = dist != null ? Math.min(70, Math.max(20, Math.round(dist * 12 + 25))) : null;
+      return { ...r, _dist: dist, _eta: minutes, _rating: ratingFor(String(r.name || "")) };
+    });
+
+    const text = search.trim().toLowerCase();
+    const cat = activeCategory.toLowerCase();
+    const isVegDish = (d: string) => /veg|paneer|aloo|gobi|mushroom/i.test(d);
+
+    return list.filter((r) => {
+      // search by name or dishes
+      if (text) {
+        const inName = String(r.name || "").toLowerCase().includes(text);
+        const inDish = String(r.dishes || "").toLowerCase().includes(text);
+        if (!inName && !inDish) return false;
+      }
+      // category filtering
+      if (activeCategory !== "All") {
+        if (!String(r.dishes || "").toLowerCase().includes(cat)) return false;
+      }
+      // veg mode
+      if (vegOnly) {
+        const hasVeg = String(r.dishes || "")
+          .split(",")
+          .some((d: string) => isVegDish(d));
+        if (!hasVeg) return false;
+      }
+      return true;
+    });
+  }, [restaurants, coords, search, activeCategory, vegOnly, coordCache]);
 
   const submit = async () => {
     if (!canSubmit || loading) return;
@@ -146,28 +328,78 @@ export default function MainPage() {
 
   return (
     <View style={styles.container}>
-      {/* Header */}
-      <View style={styles.center}>
-        <Text style={styles.title}>Welcome to Cravory</Text>
-        <Text style={styles.subtitle}>You have been signed in successfully.</Text>
+      {/* NEW: Zomato-like header */}
+      <View style={styles.searchRow}>
+        <Ionicons name="search" size={20} color="#777" style={{ marginRight: 8 }} />
+        <TextInput
+          value={search}
+          onChangeText={setSearch}
+          placeholder="Restaurant name or a dish..."
+          style={styles.searchInput}
+          placeholderTextColor="#B0B0B0"
+        />
+        <Ionicons name="mic-outline" size={20} color="#777" />
+      </View>
+
+      <View style={styles.filterRow}>
+        <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={{ gap: 10 }}>
+          {categories.map((c) => (
+            <TouchableOpacity
+              key={c}
+              onPress={() => setActiveCategory(c)}
+              style={[styles.catChip, activeCategory === c && styles.catChipActive]}
+            >
+              <Text style={[styles.catChipText, activeCategory === c && styles.catChipTextActive]}>{c}</Text>
+            </TouchableOpacity>
+          ))}
+        </ScrollView>
+        <View style={styles.vegRow}>
+          <Text style={styles.vegText}>VEG MODE</Text>
+          <Switch value={vegOnly} onValueChange={setVegOnly} thumbColor={vegOnly ? "#22c55e" : "#f4f3f4"} />
+        </View>
       </View>
 
       {/* Restaurants list */}
       <ScrollView contentContainerStyle={styles.listContainer}>
-        {restaurants.map((r) => {
+        {shownRestaurants.map((r) => {
           const open = expandedId === String(r._id);
           return (
             <View key={String(r._id)} style={styles.card}>
-              <View style={styles.cardHeader}>
-                <TouchableOpacity onPress={() => setExpandedId(open ? null : String(r._id))} style={{ flex: 1 }}>
-                  <Text style={styles.cardTitle}>{r.name}</Text>
-                  <Text style={styles.cardLink} numberOfLines={1}>{r.mapLink}</Text>
-                </TouchableOpacity>
-                {!!r.restaurantImage && (
-                  <Image source={{ uri: r.restaurantImage }} style={styles.cardImage} />
-                )}
+              {/* Hero image */}
+              {!!r.restaurantImage && <Image source={{ uri: r.restaurantImage }} style={styles.heroImage} resizeMode="cover" />}
+              {/* Content */}
+              <View style={styles.cardContent}>
+                <View style={{ flex: 1 }}>
+                  <TouchableOpacity onPress={() => setExpandedId(open ? null : String(r._id))}>
+                    <Text style={styles.cardTitle}>{r.name}</Text>
+                  </TouchableOpacity>
+                  <View style={styles.metaRow}>
+                    <Text style={styles.metaText}>
+                      {r._eta ? `${r._eta - 3}–${r._eta + 2} mins` : "—"}
+                      {r._dist != null ? `  •  ${formatDistance(r._dist)}` : ""}
+                      {"  •  Free"}
+                    </Text>
+                  </View>
+                </View>
+                <View style={styles.ratingPill}>
+                  <Ionicons name="star" size={12} color="#fff" />
+                  <Text style={styles.ratingText}>{r._rating?.toFixed(1)}</Text>
+                </View>
               </View>
 
+              {/* Badges */}
+              <View style={styles.badgesRow}>
+                <View style={styles.badge}>
+                  <Ionicons name="checkmark-circle" size={14} color="#22c55e" />
+                  <Text style={styles.badgeText}>Last 100 Orders Without Complaints</Text>
+                </View>
+                <View style={styles.badge}>
+                  <Ionicons name="flash" size={14} color={THEME} />
+                  <Text style={styles.badgeText}>Frequent</Text>
+                </View>
+              </View>
+
+              {/* Dishes chips (toggle by tapping name) */}
               {open && (
                 <View style={styles.dishesWrap}>
                   {dishesArray(r.dishes).map((d: string, idx: number) => (
@@ -180,8 +412,8 @@ export default function MainPage() {
             </View>
           );
         })}
-        {restaurants.length === 0 && (
-          <Text style={styles.emptyText}>No restaurants yet. Tap + to add one.</Text>
+        {shownRestaurants.length === 0 && (
+          <Text style={styles.emptyText}>No results. Try a different search or add a restaurant.</Text>
         )}
       </ScrollView>
 
@@ -259,41 +491,117 @@ export default function MainPage() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: "#FFFFFF" },
-  center: { alignItems: "center", justifyContent: "center", padding: 16 },
-  title: { fontSize: 22, fontWeight: "700" },
-  subtitle: { marginTop: 8, color: "#666" },
 
-  listContainer: { paddingHorizontal: 16, paddingBottom: 100, gap: 12 },
-
-  card: {
-    backgroundColor: "#FFF",
-    borderWidth: 1,
-    borderColor: "#ECECEC",
+  // NEW: header styles
+  searchRow: {
+    marginTop: 8,
+    marginHorizontal: 16,
+    height: 46,
     borderRadius: 12,
-    padding: 12,
+    backgroundColor: "#fff",
+    borderWidth: 1,
+    borderColor: "#EEE",
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    elevation: 2,
     shadowColor: "#000",
-    shadowOpacity: 0.05,
+    shadowOpacity: 0.06,
     shadowRadius: 3,
     shadowOffset: { width: 0, height: 1 },
-    elevation: 2,
   },
-  cardHeader: { flexDirection: "row", alignItems: "center", gap: 12 },
-  cardTitle: { fontSize: 16, fontWeight: "700", color: "#222" },
-  cardLink: { fontSize: 12, color: "#777", marginTop: 2, maxWidth: "80%" },
-  cardImage: { width: 56, height: 56, borderRadius: 8, backgroundColor: "#F4F4F4" },
+  searchInput: { flex: 1, color: "#222", fontSize: 14 },
 
-  dishesWrap: { flexDirection: "row", flexWrap: "wrap", gap: 8, marginTop: 10 },
-  dishChip: {
-    backgroundColor: "#FC8019",
-    paddingVertical: 6,
-    paddingHorizontal: 10,
+  filterRow: {
+    marginTop: 12,
+    paddingHorizontal: 12,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+  },
+  catChip: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+    backgroundColor: "#FAFAFA",
+    borderRadius: 18,
+    borderWidth: 1,
+    borderColor: "#EEE",
+  },
+  catChipActive: {
+    backgroundColor: THEME,
+    borderColor: THEME,
+  },
+  catChipText: { color: "#444", fontSize: 13, fontWeight: "600" },
+  catChipTextActive: { color: "#fff" },
+
+  vegRow: { flexDirection: "row", alignItems: "center", gap: 6 },
+  vegText: { color: "#666", fontSize: 12, fontWeight: "700", marginRight: 4 },
+
+  listContainer: { paddingHorizontal: 12, paddingBottom: 100, gap: 14 },
+
+  // Card
+  card: {
+    backgroundColor: "#FFF",
     borderRadius: 16,
+    borderWidth: 1,
+    borderColor: "#ECECEC",
+    overflow: "hidden",
+    elevation: 2,
+    shadowColor: "#000",
+    shadowOpacity: 0.06,
+    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 2 },
   },
-  dishChipText: { color: "#FFF", fontWeight: "600", fontSize: 12 },
+  heroImage: { width: "100%", height: 180, backgroundColor: "#F4F4F4" },
 
-  emptyText: { textAlign: "center", color: "#999", marginTop: 8 },
+  cardContent: {
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+  },
+  cardTitle: { fontSize: 18, fontWeight: "800", color: "#1F2937" },
+  metaRow: { flexDirection: "row", marginTop: 2 },
+  metaText: { color: "#6B7280", fontSize: 12 },
 
-  // FAB
+  ratingPill: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    backgroundColor: "#22c55e",
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  ratingText: { color: "#fff", fontWeight: "700", fontSize: 12 },
+
+  badgesRow: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 8,
+    paddingHorizontal: 12,
+    paddingBottom: 10,
+  },
+  badge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    backgroundColor: "#F6F6F6",
+    borderRadius: 16,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+  },
+  badgeText: { color: "#4B5563", fontSize: 12, fontWeight: "600" },
+
+  dishesWrap: { flexDirection: "row", flexWrap: "wrap", gap: 8, paddingHorizontal: 12, paddingBottom: 12 },
+  dishChip: { backgroundColor: THEME, paddingVertical: 6, paddingHorizontal: 10, borderRadius: 16 },
+  dishChipText: { color: "#FFF", fontWeight: "700", fontSize: 12 },
+
+  emptyText: { textAlign: "center", color: "#999", marginTop: 16 },
+
+  // FAB (unchanged)
   fab: {
     position: "absolute",
     right: 20,
